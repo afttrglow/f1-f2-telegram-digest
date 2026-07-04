@@ -38,10 +38,10 @@ SESSION_NAMES = [
     "Free Practice 1",
     "Free Practice 2",
     "Free Practice 3",
-    "Practice",
-    "Qualifying",
     "Sprint Race",
     "Feature Race",
+    "Qualifying",
+    "Practice",
     "Sprint",
     "Feature",
     "Grand Prix",
@@ -58,30 +58,58 @@ SESSION_ORDER = {
     "Sprint Race": 6,
     "Feature": 7,
     "Feature Race": 7,
-    "Grand Prix": 8,
     "Race": 8,
+    "Grand Prix": 8,
 }
 
 
-def fetch_lines(url):
+def fetch_html(url):
     response = requests.get(
         url,
-        timeout=20,
+        timeout=30,
         headers={
-            "User-Agent": "Mozilla/5.0 F1-F2-Telegram-Digest"
+            "User-Agent": "Mozilla/5.0 (compatible; F1-F2-Telegram-Digest/2.0)"
         },
     )
     response.raise_for_status()
+    return response.text
 
-    soup = BeautifulSoup(response.text, "html.parser")
 
-    lines = [
-        line.strip()
-        for line in soup.get_text("\n").splitlines()
-        if line.strip()
-    ]
+def clean_text(value):
+    return re.sub(r"\s+", " ", value or "").strip()
 
-    return lines
+
+def is_time(value):
+    return bool(re.match(r"^\d{1,2}:\d{2}$", value.strip()))
+
+
+def is_date(value):
+    return bool(re.match(r"^\d{1,2}\s+[A-Za-z]{3}$", value.strip()))
+
+
+def parse_date_time(date_text, time_text):
+    date_match = re.match(r"^(\d{1,2})\s+([A-Za-z]{3})$", date_text.strip())
+
+    if not date_match:
+        return None
+
+    day = int(date_match.group(1))
+    month_text = date_match.group(2)
+    month = MONTHS.get(month_text)
+
+    if not month:
+        return None
+
+    hour, minute = map(int, time_text.strip().split(":"))
+
+    return datetime(
+        YEAR,
+        month,
+        day,
+        hour,
+        minute,
+        tzinfo=TZ,
+    )
 
 
 def find_session(text):
@@ -107,224 +135,220 @@ def normalize_session(series, session):
     return session
 
 
-def clean_event_name(raw_name):
-    raw_name = raw_name.replace("NEXT", "")
-    raw_name = raw_name.replace("Races, Qualifying & Practice Sessions", "")
-    raw_name = raw_name.replace("Support us, buy us a coffee.", "")
-    raw_name = raw_name.replace("Add race dates & times to your Calendar", "")
-    raw_name = raw_name.replace("Receive email reminders", "")
+def clean_event_name(value):
+    remove_phrases = [
+        "NEXT",
+        "Races, Qualifying & Practice Sessions",
+        "Support us, buy us a coffee.",
+        "Add race dates & times to your Calendar",
+        "Receive email reminders",
+        "Toggle F1 Calendar",
+        "Toggle F2 Calendar",
+        "Date",
+        "Time",
+    ]
 
-    raw_name = re.sub(r"\s+", " ", raw_name).strip()
+    result = value
 
-    return raw_name
+    for phrase in remove_phrases:
+        result = result.replace(phrase, "")
 
+    result = clean_text(result)
 
-def make_datetime(day, month_text, time_text):
-    month = MONTHS.get(month_text)
-
-    if not month:
-        return None
-
-    hour, minute = map(int, time_text.split(":"))
-
-    return datetime(
-        YEAR,
-        month,
-        int(day),
-        hour,
-        minute,
-        tzinfo=TZ,
-    )
+    return result
 
 
-def parse_line_event(series, line):
+def event_name_from_session_text(text, session):
     """
-    Handles format like:
-    British Grand Prix Free Practice 1 3 Jul 12:30
+    Example:
+    British Grand Prix Free Practice 1 -> British Grand Prix
+    Free Practice 1 -> None, because event name comes from current_event
     """
 
-    session = find_session(line)
+    index = text.lower().find(session.lower())
 
-    if not session:
+    if index <= 0:
         return None
 
-    match = re.search(
-        r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2}:\d{2})",
-        line,
-    )
+    return clean_event_name(text[:index])
 
-    if not match:
-        return None
 
-    day, month_text, time_text = match.groups()
-    start = make_datetime(day, month_text, time_text)
-
-    if not start:
-        return None
-
-    before_date = line[:match.start()].strip()
-
-    session_index = before_date.lower().find(session.lower())
-
-    if session_index == -1:
-        return None
-
-    event_name = before_date[:session_index].strip()
+def make_event(series, event_name, session, start):
     event_name = clean_event_name(event_name)
 
-    if not event_name:
+    if not event_name or not session or not start:
         return None
-
-    session = normalize_session(series, session)
 
     return {
         "series": series,
         "event": event_name,
-        "session": session,
+        "session": normalize_session(series, session),
         "start": start,
     }
 
 
-def parse_split_event(series, lines, index):
+def parse_table_rows(series, soup):
     """
-    Handles format like:
-    British Grand Prix Free Practice 1 3 Jul
+    Preferred parser.
+    It handles table-like HTML where rows can be:
+    British Grand Prix | NEXT
+    Free Practice 1    | 3 Jul | 12:30
+    """
+
+    events = []
+    current_event = None
+
+    rows = soup.find_all("tr")
+
+    for row in rows:
+        cells = [
+            clean_text(cell.get_text(" "))
+            for cell in row.find_all(["td", "th"])
+        ]
+
+        cells = [cell for cell in cells if cell]
+
+        if not cells:
+            continue
+
+        row_text = clean_text(" ".join(cells))
+        session = find_session(row_text)
+
+        first_cell = cells[0]
+
+        if "Grand Prix" in first_cell and not session:
+            current_event = clean_event_name(first_cell)
+            continue
+
+        date_text = next((cell for cell in cells if is_date(cell)), None)
+        time_text = next((cell for cell in cells if is_time(cell)), None)
+
+        if not session or not date_text or not time_text:
+            continue
+
+        start = parse_date_time(date_text, time_text)
+
+        if not start:
+            continue
+
+        event_name = event_name_from_session_text(row_text, session) or current_event
+
+        event = make_event(series, event_name, session, start)
+
+        if event:
+            events.append(event)
+
+    return events
+
+
+def parse_text_lines(series, soup):
+    """
+    Fallback parser.
+    Handles text extraction where content appears as separate lines:
+    British Grand Prix
+    NEXT
+    Free Practice 1
+    3 Jul
     12:30
     """
 
-    line = lines[index]
+    lines = [
+        clean_text(line)
+        for line in soup.get_text("\n").splitlines()
+        if clean_text(line)
+    ]
 
-    if index + 1 >= len(lines):
-        return None
-
-    next_line = lines[index + 1]
-
-    if not re.match(r"^\d{2}:\d{2}$", next_line):
-        return None
-
-    session = find_session(line)
-
-    if not session:
-        return None
-
-    match = re.search(
-        r"(\d{1,2})\s+([A-Za-z]{3})$",
-        line,
-    )
-
-    if not match:
-        return None
-
-    day, month_text = match.groups()
-    start = make_datetime(day, month_text, next_line)
-
-    if not start:
-        return None
-
-    before_date = line[:match.start()].strip()
-
-    session_index = before_date.lower().find(session.lower())
-
-    if session_index == -1:
-        return None
-
-    event_name = before_date[:session_index].strip()
-    event_name = clean_event_name(event_name)
-
-    if not event_name:
-        return None
-
-    session = normalize_session(series, session)
-
-    return {
-        "series": series,
-        "event": event_name,
-        "session": session,
-        "start": start,
-    }
-
-
-def parse_time_context_event(series, lines, index):
-    """
-    Handles cases where the time is on its own line and the event/session/date
-    are somewhere in the previous few text lines.
-    """
-
-    time_line = lines[index]
-
-    if not re.match(r"^\d{2}:\d{2}$", time_line):
-        return None
-
-    context = " ".join(lines[max(0, index - 5):index])
-    context = re.sub(r"\s+", " ", context).strip()
-
-    session = find_session(context)
-
-    if not session:
-        return None
-
-    match = re.search(
-        r"(\d{1,2})\s+([A-Za-z]{3})",
-        context,
-    )
-
-    if not match:
-        return None
-
-    day, month_text = match.groups()
-    start = make_datetime(day, month_text, time_line)
-
-    if not start:
-        return None
-
-    before_date = context[:match.start()].strip()
-    session_index = before_date.lower().find(session.lower())
-
-    if session_index == -1:
-        return None
-
-    event_name = before_date[:session_index].strip()
-    event_name = clean_event_name(event_name)
-
-    if not event_name:
-        return None
-
-    session = normalize_session(series, session)
-
-    return {
-        "series": series,
-        "event": event_name,
-        "session": session,
-        "start": start,
-    }
-
-
-def parse_events(series, lines):
     events = []
+    current_event = None
 
     for i, line in enumerate(lines):
         ignored = [
-            "buy us a coffee",
             "support us",
+            "buy us a coffee",
             "email reminders",
             "add race dates",
-            "calendar",
+            "get calendar",
+            "timezones",
         ]
 
-        if any(x in line.lower() for x in ignored):
+        if any(item in line.lower() for item in ignored):
             continue
 
-        candidates = [
-            parse_line_event(series, line),
-            parse_split_event(series, lines, i),
-            parse_time_context_event(series, lines, i),
-        ]
+        session = find_session(line)
 
-        for event in candidates:
+        # Case 1:
+        # British Grand Prix
+        # NEXT
+        if "Grand Prix" in line and not session:
+            current_event = clean_event_name(line)
+            continue
+
+        # Case 2:
+        # Free Practice 1
+        # 3 Jul
+        # 12:30
+        if session and i + 2 < len(lines) and is_date(lines[i + 1]) and is_time(lines[i + 2]):
+            start = parse_date_time(lines[i + 1], lines[i + 2])
+            event_name = event_name_from_session_text(line, session) or current_event
+            event = make_event(series, event_name, session, start)
+
             if event:
                 events.append(event)
 
-    # Deduplicate
+            continue
+
+        # Case 3:
+        # British Grand Prix Free Practice 1
+        # 3 Jul
+        # 12:30
+        if session and i + 2 < len(lines) and is_date(lines[i + 1]) and is_time(lines[i + 2]):
+            start = parse_date_time(lines[i + 1], lines[i + 2])
+            event_name = event_name_from_session_text(line, session) or current_event
+            event = make_event(series, event_name, session, start)
+
+            if event:
+                events.append(event)
+
+            continue
+
+        # Case 4:
+        # British Grand Prix Free Practice 1 3 Jul
+        # 12:30
+        if session and i + 1 < len(lines) and is_time(lines[i + 1]):
+            date_match = re.search(r"(\d{1,2}\s+[A-Za-z]{3})$", line)
+
+            if date_match:
+                date_text = date_match.group(1)
+                text_before_date = clean_text(line[:date_match.start()])
+                start = parse_date_time(date_text, lines[i + 1])
+                event_name = event_name_from_session_text(text_before_date, session) or current_event
+                event = make_event(series, event_name, session, start)
+
+                if event:
+                    events.append(event)
+
+                continue
+
+        # Case 5:
+        # British Grand Prix Free Practice 1 3 Jul 12:30
+        if session:
+            full_match = re.search(r"(\d{1,2}\s+[A-Za-z]{3})\s+(\d{1,2}:\d{2})", line)
+
+            if full_match:
+                date_text = full_match.group(1)
+                time_text = full_match.group(2)
+                text_before_date = clean_text(line[:full_match.start()])
+                start = parse_date_time(date_text, time_text)
+                event_name = event_name_from_session_text(text_before_date, session) or current_event
+                event = make_event(series, event_name, session, start)
+
+                if event:
+                    events.append(event)
+
+    return events
+
+
+def deduplicate(events):
     unique = {}
 
     for event in events:
@@ -336,35 +360,87 @@ def parse_events(series, lines):
         )
         unique[key] = event
 
-    return list(unique.values())
+    return sorted(unique.values(), key=lambda item: item["start"])
 
 
-def get_next_race_window(events):
+def parse_events(series, html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    table_events = parse_table_rows(series, soup)
+    text_events = parse_text_lines(series, soup)
+
+    return deduplicate(table_events + text_events)
+
+
+def choose_f1_weekend(all_events):
+    """
+    Choose next/current F1 weekend.
+    Then we use its date window to include F2 sessions too.
+    """
+
     now = datetime.now(TZ)
 
-    # Include sessions that started recently, useful if script runs during a race weekend.
-    upcoming = [
-        event
-        for event in events
-        if event["start"] >= now - timedelta(hours=6)
+    f1_events = [
+        event for event in all_events
+        if event["series"] == "Formula 1"
     ]
 
-    if not upcoming:
+    grouped = defaultdict(list)
+
+    for event in f1_events:
+        grouped[event["event"]].append(event)
+
+    candidates = []
+
+    for event_name, events in grouped.items():
+        events = sorted(events, key=lambda item: item["start"])
+        first_start = events[0]["start"]
+        last_start = events[-1]["start"]
+
+        # Current or future weekend.
+        if last_start >= now - timedelta(hours=12):
+            candidates.append({
+                "event": event_name,
+                "first": first_start,
+                "last": last_start,
+                "events": events,
+            })
+
+    if not candidates:
+        return None
+
+    candidates = sorted(
+        candidates,
+        key=lambda item: (
+            item["last"] < now,
+            abs((item["first"] - now).total_seconds()),
+            item["first"],
+        ),
+    )
+
+    chosen = candidates[0]
+
+    return {
+        "title": chosen["event"],
+        "start_date": chosen["first"].date(),
+        "end_date": chosen["last"].date(),
+    }
+
+
+def select_weekend_events(all_events, weekend):
+    if not weekend:
         return []
 
-    upcoming = sorted(upcoming, key=lambda e: e["start"])
+    # Add one day buffer because F2 can sometimes start earlier.
+    start_date = weekend["start_date"] - timedelta(days=1)
+    end_date = weekend["end_date"] + timedelta(days=1)
 
-    first = upcoming[0]
-    window_start = first["start"].date()
-    window_end = window_start + timedelta(days=4)
-
-    weekend_events = [
-        event
-        for event in upcoming
-        if window_start <= event["start"].date() <= window_end
+    selected = [
+        event for event in all_events
+        if start_date <= event["start"].date() <= end_date
     ]
 
-    return sorted(weekend_events, key=lambda e: e["start"])
+    return sorted(selected, key=lambda item: item["start"])
 
 
 def bg_day(dt):
@@ -381,28 +457,20 @@ def bg_day(dt):
     return days.get(dt.strftime("%A"), dt.strftime("%A"))
 
 
-def find_main_title(events):
-    f1_events = [event for event in events if event["series"] == "Formula 1"]
-
-    if f1_events:
-        return f1_events[0]["event"]
-
-    return events[0]["event"]
-
-
-def format_message(events):
+def format_message(events, weekend, debug_info=None):
     now_text = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
-    if not events:
-        return (
-            "🏁 <b>F1 / F2 програма</b>\n\n"
-            "Не намерих предстоящ уикенд.\n\n"
-            "Причината най-вероятно е промяна във формата на календара."
-        )
+    if not events or not weekend:
+        msg = "🏁 <b>F1 / F2 програма</b>\n\n"
+        msg += "Не намерих предстоящ уикенд.\n\n"
 
-    title = find_main_title(events)
+        if debug_info:
+            msg += "<b>Debug:</b>\n"
+            msg += html.escape(debug_info[:3000])
 
-    msg = f"🏁 <b>{html.escape(title)}</b>\n"
+        return msg
+
+    msg = f"🏁 <b>{html.escape(weekend['title'])}</b>\n"
     msg += "🇧🇬 <b>Българско време</b>\n"
     msg += f"🕘 Обновено: {now_text}\n\n"
 
@@ -426,18 +494,16 @@ def format_message(events):
         for day in sorted(by_day):
             day_events = sorted(
                 by_day[day],
-                key=lambda e: (
-                    e["start"],
-                    SESSION_ORDER.get(e["session"], 99),
+                key=lambda item: (
+                    item["start"],
+                    SESSION_ORDER.get(item["session"], 99),
                 ),
             )
 
             msg += f"📅 <b>{bg_day(day_events[0]['start'])} - {day.strftime('%d.%m')}</b>\n"
 
             for event in day_events:
-                time_text = event["start"].strftime("%H:%M")
-                session_text = html.escape(event["session"])
-                msg += f"• {time_text} - {session_text}\n"
+                msg += f"• {event['start'].strftime('%H:%M')} - {html.escape(event['session'])}\n"
 
             msg += "\n"
 
@@ -455,24 +521,37 @@ def send_telegram(message):
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
-        timeout=20,
+        timeout=30,
     )
-
     response.raise_for_status()
 
 
 def main():
     all_events = []
+    debug_parts = []
 
     for series, url in SOURCES.items():
-        lines = fetch_lines(url)
-        parsed = parse_events(series, lines)
-        all_events.extend(parsed)
+        html_text = fetch_html(url)
+        events = parse_events(series, html_text)
 
-    all_events = sorted(all_events, key=lambda e: e["start"])
-    weekend_events = get_next_race_window(all_events)
+        all_events.extend(events)
 
-    message = format_message(weekend_events)
+        debug_parts.append(f"{series}: parsed {len(events)} events")
+
+        for event in events[:10]:
+            debug_parts.append(
+                f"- {event['series']} | {event['event']} | "
+                f"{event['session']} | {event['start'].strftime('%d.%m %H:%M')}"
+            )
+
+    all_events = deduplicate(all_events)
+
+    weekend = choose_f1_weekend(all_events)
+    weekend_events = select_weekend_events(all_events, weekend)
+
+    debug_info = "\n".join(debug_parts)
+
+    message = format_message(weekend_events, weekend, debug_info)
     send_telegram(message)
 
 
