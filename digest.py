@@ -1,16 +1,13 @@
-import os
-import re
-import html
-import requests
+import os, re, html, requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from collections import defaultdict
-import pytz
+from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-TZ = pytz.timezone("Europe/Sofia")
+TZ = ZoneInfo("Europe/Sofia")
 YEAR = datetime.now(TZ).year
 
 SOURCES = {
@@ -19,98 +16,74 @@ SOURCES = {
 }
 
 MONTHS = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
-    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
-    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
-SESSION_ORDER = {
-    "Free Practice 1": 1,
-    "Free Practice 2": 2,
-    "Free Practice 3": 3,
-    "Practice": 1,
-    "Sprint Qualifying": 2,
-    "Qualifying": 3,
-    "Sprint": 4,
-    "Grand Prix": 5,
-    "Feature": 5,
-}
+SESSIONS = [
+    "Sprint Qualifying",
+    "Free Practice 1",
+    "Free Practice 2",
+    "Free Practice 3",
+    "Qualifying",
+    "Practice",
+    "Sprint Race",
+    "Feature Race",
+    "Sprint",
+    "Feature",
+    "Grand Prix",
+]
 
 def fetch_lines(url):
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
     return [x.strip() for x in soup.get_text("\n").splitlines() if x.strip()]
 
-def parse_date(date_text, time_text):
-    match = re.match(r"(\d{1,2})\s+([A-Za-z]{3})", date_text)
-    if not match:
-        return None
-
-    day = int(match.group(1))
-    month = MONTHS.get(match.group(2))
-    if not month:
-        return None
-
-    hour, minute = map(int, time_text.split(":"))
-    return TZ.localize(datetime(YEAR, month, day, hour, minute))
-
-def detect_session(title):
-    session_names = [
-        "Sprint Qualifying",
-        "Free Practice 1",
-        "Free Practice 2",
-        "Free Practice 3",
-        "Qualifying",
-        "Practice",
-        "Sprint",
-        "Feature",
-        "Grand Prix",
-    ]
-
-    for session in session_names:
-        if session in title:
-            return session
-
+def find_session(text):
+    for s in SESSIONS:
+        if s.lower() in text.lower():
+            return s
     return None
-
-def clean_event_name(title, session):
-    event = title.replace(session, "").strip()
-    event = re.sub(r"\s+", " ", event)
-    return event
 
 def parse_events(series, lines):
     events = []
 
-    for i, line in enumerate(lines[:-1]):
-        session = detect_session(line)
+    for line in lines:
+        if "buy us a coffee" in line.lower() or "support us" in line.lower():
+            continue
+
+        session = find_session(line)
         if not session:
             continue
 
-        date_match = re.search(r"(\d{1,2}\s+[A-Za-z]{3})$", line)
-        if not date_match:
+        m = re.search(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2}:\d{2})", line)
+        if not m:
             continue
 
-        if not re.match(r"^\d{2}:\d{2}$", lines[i + 1]):
+        day = int(m.group(1))
+        month = MONTHS.get(m.group(2))
+        hour, minute = map(int, m.group(3).split(":"))
+
+        if not month:
             continue
 
-        date_text = date_match.group(1)
-        title = line[:date_match.start()].strip()
-        start = parse_date(date_text, lines[i + 1])
+        start = datetime(YEAR, month, day, hour, minute, tzinfo=TZ)
 
-        if not start:
+        title_before_date = line[:m.start()].strip()
+        event_name = title_before_date.replace(session, "").strip()
+
+        if not event_name:
             continue
 
-        event_name = clean_event_name(title, session)
+        if series == "Formula 1" and session == "Grand Prix":
+            session = "Race"
 
         if series == "Formula 2":
             if session == "Sprint":
                 session = "Sprint Race"
-            elif session == "Feature":
+            if session == "Feature":
                 session = "Feature Race"
-
-        if series == "Formula 1" and session == "Grand Prix":
-            session = "Race"
 
         events.append({
             "series": series,
@@ -121,23 +94,24 @@ def parse_events(series, lines):
 
     return events
 
-def find_next_weekend(all_events):
+def next_weekend(events):
     now = datetime.now(TZ)
-    upcoming = [e for e in all_events if e["start"] >= now - timedelta(hours=2)]
+    upcoming = [e for e in events if e["start"] >= now - timedelta(hours=3)]
 
     if not upcoming:
         return []
 
-    first_event_date = min(e["start"].date() for e in upcoming)
-    weekend_end = first_event_date + timedelta(days=4)
+    first = min(upcoming, key=lambda e: e["start"])
+    event_name = first["event"]
 
     return [
         e for e in upcoming
-        if first_event_date <= e["start"].date() <= weekend_end
+        if e["event"] == event_name
+        and e["start"] <= first["start"] + timedelta(days=4)
     ]
 
-def format_day(date_obj):
-    days = {
+def bg_day(dt):
+    return {
         "Monday": "Понеделник",
         "Tuesday": "Вторник",
         "Wednesday": "Сряда",
@@ -145,83 +119,64 @@ def format_day(date_obj):
         "Friday": "Петък",
         "Saturday": "Събота",
         "Sunday": "Неделя",
-    }
-    return days[date_obj.strftime("%A")]
+    }[dt.strftime("%A")]
+
+def send_telegram(text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
 
 def format_message(events):
+    if not events:
+        return "🏁 <b>F1 / F2 програма</b>\n\nНе намерих предстоящ уикенд. Parser-ът има нужда от преглед."
+
+    title = events[0]["event"]
     now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
-    if not events:
-        return (
-            "🏁 <b>F1 / F2 програма</b>\n\n"
-            "Няма намерен предстоящ състезателен уикенд."
-        )
-
-    main_event = events[0]["event"]
-
-    msg = f"🏁 <b>{html.escape(main_event)}</b>\n"
-    msg += "🇧🇬 <b>Всички часове са българско време</b>\n"
+    msg = f"🏁 <b>{html.escape(title)}</b>\n"
+    msg += "🇧🇬 <b>Българско време</b>\n"
     msg += f"🕘 Обновено: {now}\n\n"
 
     by_series = defaultdict(list)
-    for event in events:
-        by_series[event["series"]].append(event)
+    for e in events:
+        by_series[e["series"]].append(e)
 
     for series in ["Formula 1", "Formula 2"]:
         if series not in by_series:
             continue
 
-        msg += f"━━━━━━━━━━━━━━\n"
+        msg += "━━━━━━━━━━━━━━\n"
         msg += f"🏎 <b>{series}</b>\n\n"
 
         by_day = defaultdict(list)
-        for event in by_series[series]:
-            by_day[event["start"].date()].append(event)
+        for e in by_series[series]:
+            by_day[e["start"].date()].append(e)
 
         for day in sorted(by_day):
-            msg += f"📅 <b>{format_day(by_day[day][0]['start'])} - {day.strftime('%d.%m')}</b>\n"
+            msg += f"📅 <b>{bg_day(by_day[day][0]['start'])} - {day.strftime('%d.%m')}</b>\n"
 
-            day_events = sorted(
-                by_day[day],
-                key=lambda e: (
-                    e["start"],
-                    SESSION_ORDER.get(e["session"], 99)
-                )
-            )
-
-            for event in day_events:
-                time = event["start"].strftime("%H:%M")
-                msg += f"• {time} - {html.escape(event['session'])}\n"
+            for e in sorted(by_day[day], key=lambda x: x["start"]):
+                msg += f"• {e['start'].strftime('%H:%M')} - {html.escape(e['session'])}\n"
 
             msg += "\n"
 
     msg += "Източници: f1calendar.com / f2calendar.com"
     return msg
 
-def send_telegram(message):
-    response = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
+all_events = []
 
-def main():
-    all_events = []
+for series, url in SOURCES.items():
+    all_events.extend(parse_events(series, fetch_lines(url)))
 
-    for series, url in SOURCES.items():
-        lines = fetch_lines(url)
-        all_events.extend(parse_events(series, lines))
+all_events = sorted(all_events, key=lambda e: e["start"])
+events = next_weekend(all_events)
 
-    all_events = sorted(all_events, key=lambda e: e["start"])
-    next_weekend = find_next_weekend(all_events)
-    message = format_message(next_weekend)
-    send_telegram(message)
-
-if __name__ == "__main__":
-    main()
+send_telegram(format_message(events))
